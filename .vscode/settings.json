@@ -1,0 +1,12 @@
+{
+    "python.defaultInterpreterPath": "C:\\twitch-agent\\.venv-backend\\Scripts\\python.exe",
+    "python.analysis.extraPaths": [
+        "C:\\twitch-agent\\.venv-backend\\Lib\\site-packages",
+        "C:\\twitch-agent\\.venv-bot\\Lib\\site-packages",
+        "C:\\twitch-agent\\.venv-runner\\Lib\\site-packages",
+        "C:\\twitch-agent\\.venv-orch\\Lib\\site-packages"
+    ],
+    "python.analysis.autoImportCompletions": true,
+    "python.analysis.typeCheckingMode": "basic"
+}
+

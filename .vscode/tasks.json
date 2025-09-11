@@ -1,0 +1,74 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Backend: Uvicorn",
+        "type": "shell",
+        "command": "${workspaceFolder}\\.venv-backend\\Scripts\\python.exe",
+        "args": ["-m", "uvicorn", "main:app", "--reload", "--port", "8000"],
+        "options": { "cwd": "${workspaceFolder}\\backend" },
+        "presentation": { "reveal": "always", "panel": "dedicated", "group": "stack" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Bot: TwitchIO",
+        "type": "shell",
+        "command": "${workspaceFolder}\\.venv-bot\\Scripts\\python.exe",
+        "args": ["main.py"],
+        "options": { "cwd": "${workspaceFolder}\\bot" },
+        "presentation": { "reveal": "always", "panel": "dedicated", "group": "stack" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Runner: PyAutoGUI",
+        "type": "shell",
+        "command": "${workspaceFolder}\\.venv-runner\\Scripts\\python.exe",
+        "args": ["runner.py"],
+        "options": { "cwd": "${workspaceFolder}\\runner" },
+        "presentation": { "reveal": "always", "panel": "dedicated", "group": "stack" },
+        "problemMatcher": []
+      },
+      {
+        "label": "Orchestrator",
+        "type": "shell",
+        "command": "${workspaceFolder}\\.venv-orch\\Scripts\\python.exe",
+        "args": ["orch.py"],
+        "options": { "cwd": "${workspaceFolder}\\orchestrator" },
+        "presentation": { "reveal": "always", "panel": "dedicated", "group": "stack" },
+        "problemMatcher": []
+      },
+  
+      {
+        "label": "Start All",
+        "dependsOrder": "parallel",
+        "dependsOn": [
+          "Backend: Uvicorn",
+          "Bot: TwitchIO",
+          "Runner: PyAutoGUI",
+          "Orchestrator"
+        ]
+      },
+  
+      {
+        "label": "Health: Backend routes",
+        "type": "shell",
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-Command",
+          "try {",
+          "  Invoke-RestMethod http://127.0.0.1:8000/docs | Out-Null; Write-Host 'OK /docs';",
+          "  $q = Invoke-RestMethod http://127.0.0.1:8000/queue; $q | ConvertTo-Json -Compress | Write-Host;",
+          "  Invoke-RestMethod http://127.0.0.1:8000/approved/prompt/next | ConvertTo-Json -Compress | Write-Host;",
+          "  Invoke-RestMethod http://127.0.0.1:8000/approved/next | ConvertTo-Json -Compress | Write-Host;",
+          "} catch {",
+          "  Write-Host 'Error:' $_.Exception.Message",
+          "}"
+        ],
+        "presentation": { "reveal": "always", "panel": "shared" },
+        "problemMatcher": []
+      }
+      
+    ]
+  }
+  

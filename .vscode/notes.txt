@@ -1,0 +1,2 @@
+Start all four services: Ctrl+Alt+R
+Stop all tasks: Ctrl+Alt+Shift+X

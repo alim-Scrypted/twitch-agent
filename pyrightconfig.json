@@ -1,0 +1,9 @@
+{
+    "venvPath": "C:\\twitch-agent",
+    "executionEnvironments": [
+        { "root": "./backend", "venv": ".venv-backend" },
+        { "root": "./bot", "venv": ".venv-bot" },
+        { "root": "./runner", "venv": ".venv-runner" },
+        { "root": "./orchestrator", "venv": ".venv-orch" }
+    ]
+}
