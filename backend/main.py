@@ -45,6 +45,7 @@ class DecisionReq(BaseModel):
 class EventReq(BaseModel):
     type: str
     id: int
+    text: str | None = None
 
 # --- WebSocket broadcast for overlay/bot ---
 
@@ -203,15 +204,33 @@ def submit(req: SubmitPromptReq):
         return {"id": sid}
 
     elif req.type == "actions":
+        # Auto-approve safe actions at submit-time using regex-based screening
         code = (req.code or "")
-        lowered = code.replace(" ","").lower()
-        for bad in ("import","exec(","eval(","__","subprocess","os.","sys.","open("):
-            if bad in lowered:
-                return {"error":"Generated actions contain disallowed tokens"}
+        lc = code.lower()
+        banned_patterns = (
+            r"(?<!\.)\bopen\(",
+            r"\bimport\b",
+            r"\bexec\(",
+            r"\beval\(",
+            r"__",
+            r"\bos\.",
+            r"\bsys\.",
+            r"\bsubprocess\b",
+        )
+        import re as _re
+        if any(_re.search(p, lc) for p in banned_patterns):
+            return {"error": "Generated actions contain disallowed tokens"}
+
         sid = NEXT_ID; NEXT_ID += 1
-        SUBMISSIONS[sid] = {"id": sid, "user": req.user, "type": "actions",
-                            "code": code, "status": "queued", "votes": 0}
-        broadcast({"type":"queued","item":SUBMISSIONS[sid]})
+        item = {"id": sid, "user": req.user, "type": "actions",
+                "code": code, "status": "approved", "votes": 0}
+        SUBMISSIONS[sid] = item
+        # Immediately enqueue for runner
+        try:
+            APPROVED.put_nowait({"id": sid, "user": req.user, "code": code})
+        except Exception:
+            pass
+        broadcast({"type": "auto_approved_actions", "id": sid})
         return {"id": sid}
 
     else:
@@ -271,7 +290,10 @@ async def approved_next():
 @app.post("/event")
 def event(req: EventReq):
     # Optional: runner/bot can post status like {"type":"finished","id":123}
-    broadcast({"type": req.type, "id": req.id})
+    payload = {"type": req.type, "id": req.id}
+    if req.text is not None:
+        payload["text"] = req.text
+    broadcast(payload)
     return {"ok": True}
 
 @app.post("/move-to-history")
