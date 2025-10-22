@@ -6,6 +6,23 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+# --- Tiny regex validator for safe actions ---
+BANNED_PATTERNS = [
+    r'(?<!\.)\bopen\(',   # bans plain open(, allows agent.open_app if still present
+    r'\bimport\b',
+    r'\bexec\(',
+    r'\beval\(',
+    r'__',                # dunders
+    r'\bos\.',
+    r'\bsys\.',
+    r'\bsubprocess\b'
+]
+
+def looks_safe(code: str) -> bool:
+    c = (code or "")
+    lc = c.lower()
+    return not any(re.search(p, lc) for p in BANNED_PATTERNS)
+
 
 
 def require_admin(x_admin_key: str = Header(None)):
@@ -187,7 +204,7 @@ def prepare_prompt_for_ai(text: str) -> str:
     return t
 
 @app.post("/submit")
-def submit(req: SubmitPromptReq):
+async def submit(req: SubmitPromptReq):
     global NEXT_ID
     if req.type == "prompt":
         text = (req.text or "").strip()
@@ -204,34 +221,16 @@ def submit(req: SubmitPromptReq):
         return {"id": sid}
 
     elif req.type == "actions":
-        # Auto-approve safe actions at submit-time using regex-based screening
         code = (req.code or "")
-        lc = code.lower()
-        banned_patterns = (
-            r"(?<!\.)\bopen\(",
-            r"\bimport\b",
-            r"\bexec\(",
-            r"\beval\(",
-            r"__",
-            r"\bos\.",
-            r"\bsys\.",
-            r"\bsubprocess\b",
-        )
-        import re as _re
-        if any(_re.search(p, lc) for p in banned_patterns):
+        if not looks_safe(code):
             return {"error": "Generated actions contain disallowed tokens"}
-
         sid = NEXT_ID; NEXT_ID += 1
-        item = {"id": sid, "user": req.user, "type": "actions",
-                "code": code, "status": "approved", "votes": 0}
-        SUBMISSIONS[sid] = item
-        # Immediately enqueue for runner
-        try:
-            APPROVED.put_nowait({"id": sid, "user": req.user, "code": code})
-        except Exception:
-            pass
-        broadcast({"type": "auto_approved_actions", "id": sid})
-        return {"id": sid}
+        SUBMISSIONS[sid] = {"id": sid, "user": req.user, "type": "actions",
+                            "code": code, "status": "approved", "votes": 0}
+        # auto-approve: enqueue to APPROVED so the runner picks it up
+        await APPROVED.put(SUBMISSIONS[sid])
+        broadcast({"type":"approved","id":sid,"sub_type":"actions"})
+        return {"id": sid, "message": "Auto-approved and queued for execution"}
 
     else:
         return {"error": "Unknown submission type"}
