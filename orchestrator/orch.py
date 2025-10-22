@@ -14,6 +14,24 @@ def synthesize_actions(prompt: str) -> str:
     text = prompt.replace('"', "'")[:120]
     return 'agent.open_app("notepad"); agent.wait(0.4); agent.type("' + text + '")'
 
+def call_ai_for_actions(prompt: str) -> str:
+    url = os.getenv("AI_API_URL")
+    key = os.getenv("AI_API_KEY")
+    if url:
+        try:
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            r = requests.post(url, json={"prompt": prompt}, headers=headers, timeout=20)
+            if r.ok:
+                j = r.json()
+                return j.get("actions") or j.get("code") or j.get("text") or synthesize_actions(prompt)
+            else:
+                print("AI API error:", r.status_code, r.text[:200])
+        except Exception as e:
+            print("AI API exception:", repr(e))
+    return synthesize_actions(prompt)
+
 def main():
     print("🧠 Orchestrator polling for approved prompts...")
     while True:
@@ -28,7 +46,7 @@ def main():
             if latest:
                 pid, text, user = latest["id"], latest["text"], latest.get("user")
                 print(f"\n🪄 Generating actions for prompt #{pid} from {user}: {text}")
-                actions = synthesize_actions(text)
+                actions = call_ai_for_actions(text)
                 r = requests.post(
                     f"{BACKEND}/submit",
                     json={"user": "orchestrator", "type": "actions", "code": actions},

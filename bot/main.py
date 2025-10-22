@@ -72,6 +72,8 @@ class Bot(commands.Bot):
 		"""Main loop that handles 5-prompt selection and polling"""
 		while True:
 			try:
+				# Keep only prompts that have a backend-assigned id
+				self.pending_prompts = [p for p in self.pending_prompts if p and p.get("id")]
 				print(f"🔍 Loop: {len(self.pending_prompts)} prompts, processing: {self.is_processing}")
 				
 				# Failsafe: reset if stuck
@@ -143,8 +145,26 @@ class Bot(commands.Bot):
 		
 		channel = self.get_channel(CHANNEL)
 		if channel:
-			# Find winner using integer counts
-			winner_index = max(self.poll_votes.keys(), key=lambda i: self.poll_votes[i])
+			# Winner with tiebreakers: votes desc, timestamp asc, then random
+			counts = self.poll_votes
+			if counts:
+				max_votes = max(counts.values())
+				tied = [i for i, c in counts.items() if c == max_votes]
+				if len(tied) > 1:
+					earliest_ts = min(self.current_poll[i].get("timestamp", float("inf")) for i in tied)
+					tied_earliest = [i for i in tied if self.current_poll[i].get("timestamp", float("inf")) == earliest_ts]
+					if len(tied_earliest) > 1:
+						winner_index = random.choice(tied_earliest)
+						await self.queue_chat("⚖️ Tie detected — breaking randomly among earliest submissions.")
+					else:
+						winner_index = tied_earliest[0]
+						await self.queue_chat("⚖️ Tie detected — earliest submission wins.")
+				else:
+					winner_index = tied[0]
+			else:
+				winner_index = 0
+
+
 			winner_prompt = self.current_poll[winner_index]
 			vote_count = self.poll_votes[winner_index]
 			
@@ -152,6 +172,18 @@ class Bot(commands.Bot):
 			await self.queue_chat(f"🏆 WINNER: {winner_prompt['user']} with {vote_count} votes!")
 			await self.queue_chat(f"📝 '{winner_prompt['text']}'")
 			await self.queue_chat("✅ This wish is my command!")
+
+			# Notify backend: mark winner and enqueue cleaned prompt for AI bridge
+			try:
+				wid = winner_prompt.get("id")
+				if wid:
+					r = await post_async(f"{BACKEND}/prompt/win", json={"id": wid}, timeout=5)
+					if r.ok:
+						print(f"🧠 Winner #{wid} queued for AI bridge")
+					else:
+						print(f"⚠️ Failed to queue winner: {r.text}")
+			except Exception as e:
+				print(f"⚠️ Failed to mark winner: {e}")
 
 		# Stop scoreboard if running
 		if self.scoreboard_task and not self.scoreboard_task.done():
@@ -199,8 +231,13 @@ class Bot(commands.Bot):
 				json={"user": ctx.author.name, "type": "prompt", "text": idea}, 
 				timeout=5)
 			
-			if r.ok:
-				sid = r.json().get("id")
+			# Backend returns 200 with either {id} or {error}
+			try:
+				resp = r.json()
+			except Exception:
+				resp = {}
+			sid = (resp or {}).get("id")
+			if sid:
 				prompt_data = {
 					"user": ctx.author.name,
 					"text": idea,
@@ -211,7 +248,8 @@ class Bot(commands.Bot):
 				print(f"📝 Added prompt #{sid}: {idea[:50]}... (Queue: {len(self.pending_prompts)})")
 				await self.queue_chat(f"📝 Queued! ({len(self.pending_prompts)} total)")
 			else:
-				await self.queue_chat("❌ Failed to submit")
+				err = (resp or {}).get("error") or r.text
+				await self.queue_chat(f"❌ Rejected: {err or 'Failed to submit'}")
 		except Exception as e:
 			await self.queue_chat(f"❌ Error: {e.__class__.__name__}")
 	

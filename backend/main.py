@@ -1,4 +1,5 @@
-import asyncio, time
+import asyncio, time, os, requests
+import re
 from typing import Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
 from fastapi.responses import HTMLResponse
@@ -59,6 +60,131 @@ def broadcast(event: Dict):
 
 # --- Endpoints ---
 
+# --- Prompt moderation ---
+
+PROMPT_BANNED_PATTERNS = [
+    r"```",                   # fenced code
+    r"`.+?`",                 # inline code
+    r"\b(import|def|class)\b",
+    r"\b(sudo|wget|curl|rm\s+-rf|powershell|cmd\.exe)\b",
+    r"\b(http|https)://",
+    r"<script", r"</script", r"<\?php",
+    r"\b(select|drop|insert|update)\b\s"
+]
+NSFW_WORDS = {
+    "nsfw","sex","porn","porno","pornography","nude","nudity","xxx","erotic","explicit","fetish"
+}
+
+def _normalize_leetspeak(s: str) -> str:
+    # map common leet to letters
+    table = str.maketrans({
+        "0":"o", "1":"i", "!":"i", "|":"l", "3":"e", "4":"a",
+        "5":"s", "7":"t", "8":"b", "9":"g", "$":"s", "@":"a"
+    })
+    return s.translate(table)
+
+def _has_repeated_ngram(text: str) -> bool:
+    t = re.sub(r"\s+", "", text or "")
+    ngram_lengths = [2,3,4]
+    for n in ngram_lengths:
+        if len(t) < n * 4:
+            continue
+        # count occurrences of each n-gram
+        counts = {}
+        for i in range(0, len(t)-n+1):
+            g = t[i:i+n]
+            counts[g] = counts.get(g, 0) + 1
+        # if any short n-gram repeats a lot, treat as smash
+        if any(c >= max(4, len(t) // (n*3)) for c in counts.values()):
+            return True
+    return False
+
+def _gibberish_reason(text: str) -> str | None:
+    t = (text or "").strip()
+    if len(t) < 8:
+        return "too short"
+    # Excessive repeated characters (e.g., aaaaaaa, !!!!!)
+    if re.search(r"(.)\1{5,}", t):
+        return "excessive repeated characters"
+    # Character variety
+    uniq = len(set(t))
+    if len(t) > 20 and (uniq / len(t)) < 0.15:
+        return "very low character variety"
+    # Mostly numbers
+    alnum = [c for c in t if c.isalnum()]
+    if alnum:
+        digits = sum(c.isdigit() for c in alnum)
+        if (digits / len(alnum)) > 0.6:
+            return "mostly numbers"
+    # Too few real words
+    words = re.findall(r"[A-Za-z]+", t)
+    alpha_words = [w for w in words if len(w) >= 3]
+    if len(alpha_words) < 3:
+        return "too few meaningful words"
+    # Very low vowel ratio (common in random strings)
+    letters = [c for c in t.lower() if c.isalpha()]
+    if len(letters) >= 6:
+        vowels = sum(c in "aeiou" for c in letters)
+        if (vowels / len(letters)) < 0.25:
+            return "very low vowel ratio"
+    # Non-alphanumeric noise
+    noise = sum(1 for c in t if not c.isalnum() and not c.isspace() and c not in ".,!?'-")
+    if (noise / max(1, len(t))) > 0.4:
+        return "too much non-alphanumeric noise"
+    if _has_repeated_ngram(t):
+        return "repeated pattern gibberish"
+    return None
+
+def prompt_violation(text: str) -> str | None:
+    t = (text or "").lower()
+    t_norm = _normalize_leetspeak(t)
+    for w in NSFW_WORDS:
+        if w in t_norm:
+            return "NSFW content not allowed"
+    for pat in PROMPT_BANNED_PATTERNS:
+        if re.search(pat, t_norm, re.IGNORECASE):
+            return "code/unsafe content not allowed"
+    g = _gibberish_reason(text)
+    if g:
+        return f"gibberish: {g}"
+    return None
+
+# --- Prompt cleanup for AI bridge ---
+
+BAD_WORDS = {
+    # mild profanity; extend as needed
+    "fuck","shit","bitch","asshole","dick","cunt","bastard"
+}
+
+def _mask_words(text: str, words: set[str]) -> str:
+    def repl(m):
+        w = m.group(0)
+        if len(w) <= 2:
+            return "*" * len(w)
+        return w[0] + ("*" * (len(w)-2)) + w[-1]
+    for w in sorted(words | NSFW_WORDS, key=len, reverse=True):
+        text = re.sub(rf"\b{re.escape(w)}\b", repl, text, flags=re.IGNORECASE)
+    return text
+
+def prepare_prompt_for_ai(text: str) -> str:
+    t = (text or "").strip()
+    t = re.sub(r"`{1,3}", "", t)                 # remove backticks/code fences
+    t = re.sub(r"https?://\S+", "", t)           # drop URLs
+    t = re.sub(r"\s+", " ", t).strip()           # collapse whitespace
+    t = re.sub(r"([!?.,])\1{1,}", r"\1", t)      # dedupe punctuation
+
+    # Sentence-case first letter, keep casing of proper nouns as-is
+    if t and t[0].isalpha():
+        t = t[0].upper() + t[1:]
+
+    # Ensure terminal punctuation if looks like a sentence
+    if t and t[-1] not in ".!?":
+        t += "."
+
+    # Mask profanity to keep content safe for downstream AI
+    t = _mask_words(t, BAD_WORDS)
+    return t
+
 @app.post("/submit")
 def submit(req: SubmitPromptReq):
     global NEXT_ID
@@ -66,6 +192,10 @@ def submit(req: SubmitPromptReq):
         text = (req.text or "").strip()
         if not text or len(text) > 500:
             return {"error": "Empty or too long prompt"}
+        reason = prompt_violation(text)
+        if reason:
+            broadcast({"type":"auto_rejected_prompt","user": req.user, "text": text, "reason": reason})
+            return {"error": f"Unsafe prompt: {reason}"}
         sid = NEXT_ID; NEXT_ID += 1
         SUBMISSIONS[sid] = {"id": sid, "user": req.user, "type": "prompt",
                             "text": text, "status": "queued", "votes": 0}
@@ -163,6 +293,87 @@ def move_to_history(prompt_ids: list[int]):
     
     broadcast({"type": "prompts_moved_to_history", "count": moved_count})
     return {"message": f"Moved {moved_count} prompts to history"}
+
+# --- Winner marking + AI bridge enqueue ---
+
+class WinnerReq(BaseModel):
+    id: int = Field(..., description="Winning prompt id")
+
+@app.post("/prompt/win")
+async def prompt_win(req: WinnerReq):
+    sub = SUBMISSIONS.get(req.id) or PROMPTS_HISTORY.get(req.id)
+    if not sub or sub.get("type") != "prompt":
+        raise HTTPException(status_code=404, detail="Winner not found")
+
+    clean = prepare_prompt_for_ai(sub.get("text") or "")
+    # Mark outcome and store cleaned text wherever the item lives
+    if req.id in SUBMISSIONS:
+        SUBMISSIONS[req.id]["outcome"] = "won"
+        SUBMISSIONS[req.id]["clean_text"] = clean
+    else:
+        PROMPTS_HISTORY[req.id]["outcome"] = "won"
+        PROMPTS_HISTORY[req.id]["clean_text"] = clean
+
+    # Enqueue for orchestrator bridge
+    await APPROVED_PROMPTS.put({"id": req.id, "user": sub.get("user"), "text": clean})
+    broadcast({"type": "prompt_won", "id": req.id})
+    return {"message": "Winner queued for AI bridge", "id": req.id}
+
+# --- Cleaned prompt editing/rebuild ---
+
+class CleanUpdateReq(BaseModel):
+    id: int
+    clean_text: str
+
+@app.post("/prompt/clean/update")
+def prompt_clean_update(req: CleanUpdateReq, x_admin_key: str = Header(None)):
+    require_admin(x_admin_key)
+    sub = SUBMISSIONS.get(req.id) or PROMPTS_HISTORY.get(req.id)
+    if not sub or sub.get("type") != "prompt":
+        raise HTTPException(status_code=404, detail="Prompt not found")
+    # Accept direct edits from moderator
+    if req.id in SUBMISSIONS:
+        SUBMISSIONS[req.id]["clean_text"] = (req.clean_text or "").strip()
+    else:
+        PROMPTS_HISTORY[req.id]["clean_text"] = (req.clean_text or "").strip()
+    broadcast({"type": "prompt_clean_updated", "id": req.id})
+    return {"ok": True}
+
+class CleanRebuildReq(BaseModel):
+    id: int
+
+def _grammar_correct(text: str) -> str:
+    url = os.getenv("GRAMMAR_API_URL")
+    if not url:
+        return text
+    try:
+        headers = {"Content-Type": "application/json"}
+        key = os.getenv("GRAMMAR_API_KEY")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        r = requests.post(url, json={"text": text}, headers=headers, timeout=10)
+        if r.ok:
+            j = r.json()
+            return j.get("text") or j.get("corrected") or text
+    except Exception:
+        pass
+    return text
+
+@app.post("/prompt/clean/rebuild")
+def prompt_clean_rebuild(req: CleanRebuildReq, x_admin_key: str = Header(None)):
+    require_admin(x_admin_key)
+    sub = SUBMISSIONS.get(req.id) or PROMPTS_HISTORY.get(req.id)
+    if not sub or sub.get("type") != "prompt":
+        raise HTTPException(status_code=404, detail="Prompt not found")
+    original = sub.get("text") or ""
+    corrected = _grammar_correct(original)
+    rebuilt = prepare_prompt_for_ai(corrected)
+    if req.id in SUBMISSIONS:
+        SUBMISSIONS[req.id]["clean_text"] = rebuilt
+    else:
+        PROMPTS_HISTORY[req.id]["clean_text"] = rebuilt
+    broadcast({"type": "prompt_clean_rebuilt", "id": req.id})
+    return {"ok": True, "clean_text": rebuilt}
 
 @app.websocket("/ws")
 async def ws_overlay(websocket: WebSocket):
@@ -293,6 +504,29 @@ body{
 }
 .toast.show{ opacity:1; transform: translateY(0) }
 
+/* modal */
+.modal{
+  position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+  background: rgba(0,0,0,.45); z-index: 50;
+}
+.modal.show{ display:flex }
+.modal-content{
+  width: min(640px, 92vw);
+  background: linear-gradient(180deg, #0f1c2f, #0b1524);
+  border:1px solid rgba(124,156,251,.35);
+  border-radius: 14px; padding: 14px; box-shadow: var(--glow);
+}
+.modal-content h4{ margin: 4px 2px 12px; font-size: 14px; color: #d6e1ff; }
+.modal-section{ margin: 8px 0 10px; }
+.modal-label{ font-size: 12px; color: var(--muted); margin-bottom: 6px }
+.modal-text{
+  white-space: pre-wrap; font-size: 13px; color: var(--text);
+  background: rgba(255,255,255,.02);
+  border: 1px solid rgba(124,156,251,.15);
+  padding: 10px; border-radius: 10px;
+}
+.modal-actions{ display:flex; justify-content:flex-end; gap:8px; margin-top: 10px; }
+
 /* responsive */
 @media (max-width: 980px){
   .card{ grid-column: span 12; }
@@ -330,12 +564,38 @@ body{
           <div class="dim">No processed prompts.</div>
         </div>
       </section>
+
+      <section class="card">
+        <h3>Winners (AI-ready)</h3>
+        <div id="winners" class="list">
+          <div class="dim">No winners yet.</div>
+        </div>
+      </section>
     </div>
 
     <div class="footer">Tip: prompts move to history after voting. Use reject button to remove unsafe prompts.</div>
   </div>
 
   <div id="toast" class="toast"></div>
+
+  <div id="winnerModal" class="modal">
+    <div class="modal-content">
+      <h4>Winner #<span id="wm-id"></span></h4>
+      <div class="modal-section">
+        <div class="modal-label">Original</div>
+        <div id="wm-original" class="modal-text"></div>
+      </div>
+      <div class="modal-section">
+        <div class="modal-label">AI-ready</div>
+        <textarea id="wm-clean" class="modal-text" style="width:100%; min-height: 110px;"></textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="rebuildWinner()">Rebuild</button>
+        <button class="btn ok" onclick="saveWinner()">Save</button>
+        <button class="btn" onclick="closeWinner()">Close</button>
+      </div>
+    </div>
+  </div>
 
 <script>
 const BASE = location.origin;
@@ -404,6 +664,83 @@ function historyRow(it){
   return el;
 }
 
+function winnersRow(it){
+  const el = document.createElement('div'); el.className='row';
+
+  const id = document.createElement('div'); id.className='badge'; id.textContent = '#' + it.id;
+  const kind = document.createElement('div'); kind.className='kind'; 
+  kind.textContent = 'WINNER';
+  kind.style.color = '#36d399';
+
+  const meta = document.createElement('div'); meta.className='meta';
+  const original = document.createElement('div'); original.textContent = it.text || '';
+  const cleaned = document.createElement('div'); cleaned.textContent = 'AI-ready: ' + (it.clean_text || '(pending)');
+  cleaned.style.color = '#a8b9ff'; cleaned.style.fontSize = '12px'; cleaned.style.opacity = .9;
+  meta.appendChild(original); meta.appendChild(cleaned);
+
+  const controls = document.createElement('div'); controls.className='controls';
+  if(it.processed_at){
+    const ts = document.createElement('div');
+    const d = new Date(it.processed_at * 1000);
+    ts.textContent = d.toLocaleTimeString();
+    ts.style.fontSize = '11px'; ts.style.color = '#96a3b8'; ts.style.marginRight = '6px';
+    controls.appendChild(ts);
+  }
+  const view = document.createElement('button'); view.className='btn sm'; view.textContent='View';
+  view.onclick = (e)=>{ e.stopPropagation(); openWinner(it); };
+  controls.appendChild(view);
+
+  el.appendChild(id); el.appendChild(kind); el.appendChild(meta); el.appendChild(controls);
+  el.onclick = ()=>openWinner(it);
+  return el;
+}
+
+function openWinner(it){
+  try{
+    document.getElementById('wm-id').textContent = it.id ?? '';
+    document.getElementById('wm-original').textContent = it.text || '';
+    const c = document.getElementById('wm-clean');
+    c.value = it.clean_text || '';
+    document.getElementById('winnerModal').classList.add('show');
+  }catch(e){ toast('Open error: '+e); }
+}
+function closeWinner(){
+  document.getElementById('winnerModal').classList.remove('show');
+}
+
+async function saveWinner(){
+  const id = +(document.getElementById('wm-id').textContent||0);
+  const clean = document.getElementById('wm-clean').value || '';
+  const k = getKey(); if(!k){ setKey(); return; }
+  try{
+    const r = await fetch(BASE + '/prompt/clean/update', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-ADMIN-KEY':k},
+      body: JSON.stringify({id, clean_text: clean})
+    });
+    const j = await r.json();
+    if(!r.ok){ throw new Error(j.detail || 'Save failed'); }
+    toast('Saved');
+    refresh(false);
+  }catch(e){ toast('Save error: '+e); }
+}
+
+async function rebuildWinner(){
+  const id = +(document.getElementById('wm-id').textContent||0);
+  const k = getKey(); if(!k){ setKey(); return; }
+  try{
+    const r = await fetch(BASE + '/prompt/clean/rebuild', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-ADMIN-KEY':k},
+      body: JSON.stringify({id})
+    });
+    const j = await r.json();
+    if(!r.ok){ throw new Error(j.detail || 'Rebuild failed'); }
+    document.getElementById('wm-clean').value = j.clean_text || '';
+    toast('Rebuilt');
+  }catch(e){ toast('Rebuild error: '+e); }
+}
+
 async function refresh(force){
   if(force) status('Loading…');
   try{
@@ -414,16 +751,20 @@ async function refresh(force){
     // Fetch history
     const historyR = await fetch(BASE + '/history');
     const historyItems = await historyR.json();
+    const winners = historyItems.filter(i=>i.outcome==='won');
 
     const pList = document.getElementById('prompts');
     const hList = document.getElementById('history');
-    pList.innerHTML = ''; hList.innerHTML = '';
+    const wList = document.getElementById('winners');
+    pList.innerHTML = ''; hList.innerHTML = ''; wList.innerHTML = '';
 
     if(!prompts.length) pList.innerHTML = '<div class="dim">No queued prompts.</div>';
     if(!historyItems.length) hList.innerHTML = '<div class="dim">No processed prompts.</div>';
+    if(!winners.length) wList.innerHTML = '<div class="dim">No winners yet.</div>';
 
     for(const it of prompts) pList.appendChild(row(it));
     for(const it of historyItems) hList.appendChild(historyRow(it));
+    for(const it of winners) wList.appendChild(winnersRow(it));
 
     status('');
   }catch(e){
