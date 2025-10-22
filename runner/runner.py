@@ -1,90 +1,66 @@
-import os, time, threading, requests, traceback
-import re
-import pyautogui as pag
+import os, time, json, traceback, re, sys
+from pathlib import Path
+import requests
 from ast_allowlist import validate_snippet
 
 BACKEND = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
 
-pag.FAILSAFE = True
+OUT_DIR = Path(__file__).resolve().parent / "output"
+OUT_DIR.mkdir(exist_ok=True)
 
 class Agent:
-    def move(self, x: int, y: int, duration:float=0.2):
-        pag.moveTo(int(x), int(y), duration=max(0.0, float(duration)))
-    def click(self, button:str="left", clicks:int=1, interval:float=0.1):
-        pag.click(button=button, clicks=int(clicks), interval=max(0.0, float(interval)))
-    def type(self, text:str, interval:float=0.03):
-        pag.write(str(text), interval=max(0.0, float(interval)))
-    def hotkey(self, *keys):
-        pag.hotkey(*[str(k) for k in keys])
-    def wait(self, seconds:float=0.5):
-        time.sleep(min(max(0.0, float(seconds)), 2.0))
-    # Safe primitives (no GUI launching)
-    def log(self, text:str):
-        print(str(text))
-    def write_output(self, text:str):
+    def log(self, msg: str):
+        print(f"[agent] {msg}")
+    def write_output(self, filename: str, content: str):
+        name = "".join(ch for ch in filename if ch.isalnum() or ch in ("-","_","."))
+        p = OUT_DIR / name
+        p.write_text(str(content), encoding="utf-8")
+        print(f"[agent] wrote {p.name}")
+    def broadcast(self, backend: str, event: str, sid: int | None = None):
         try:
-            with open("agent_output.txt", "a", encoding="utf-8") as f:
-                f.write(str(text) + "\n")
-        except Exception:
-            pass
-    def broadcast(self, text:str):
-        try:
-            requests.post(f"{BACKEND}/event", json={"type":"runner_msg","id":0,"text":str(text)}, timeout=3)
+            requests.post(backend + "/event", json={"type": event, "id": sid or -1}, timeout=2)
         except Exception:
             pass
 
 agent = Agent()
 
 BANNED_PATTERNS = [
-    r'(?<!\.)\bopen\(',   # bans plain open( ... ) not obj.open_(...)
+    r'(?<!\.)\bopen\(',
     r'\bimport\b',
     r'\bexec\(',
     r'\beval\(',
-    r'__',                # dunders
-    r'\bos\.',            # os.*
-    r'\bsys\.',           # sys.*
-    r'\bsubprocess\b',
-    r'\bopen_app\b',      # remove Notepad GUI behavior entirely
+    r'__',
+    r'\bos\.',
+    r'\bsys\.',
+    r'\bsubprocess\b'
 ]
 
 def looks_safe(code: str) -> bool:
-    c = (code or "")
-    lc = c.lower()
+    lc = (code or "").lower()
     return not any(re.search(p, lc) for p in BANNED_PATTERNS)
 
-def execute_snippet(code: str, timeout_s: float = 5.0) -> bool:
-    # Normalize smart quotes from mobile keyboards
-    code = (code or "").replace("“", '"').replace("”", '"').replace("’", "'")
-
-    # Precheck for banned tokens
+def execute_snippet(code: str, sid: int, timeout_s: float = 6.0) -> bool:
     if not looks_safe(code):
         print("🚫 Banned token detected before execution.")
         return False
-
-    # Compile first so SyntaxError is caught cleanly
     try:
-        code_obj = compile(code, "<snippet>", "exec")
+        compiled = compile(code, "<snippet>", "exec")
     except SyntaxError as e:
         print(f"❌ SyntaxError: {e}")
         return False
-
-    success = {"ok": True}
-
+    ok = {"v": True}
     def run():
         try:
-            exec(code_obj, {"agent": agent}, {})
+            exec(compiled, {"agent": agent}, {})
         except Exception:
-            print("❌ Exception while running snippet:")
-            print(traceback.format_exc())
-            success["ok"] = False
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout_s)
+            print("❌ Exception:\n" + traceback.format_exc())
+            ok["v"] = False
+    import threading
+    t = threading.Thread(target=run, daemon=True); t.start(); t.join(timeout_s)
     if t.is_alive():
-        print("⏱️  Snippet timed out")
+        print("⏱️  Timed out")
         return False
-    return success["ok"]
+    return ok["v"]
 
 def execute_snippet_subproc(code: str, timeout_s: float = 6.0) -> bool:
     try:
@@ -104,11 +80,12 @@ def poll_loop():
             if sub and sub.get("code"):
                 sid, code, user = sub["id"], sub["code"], sub.get("user")
                 print(f"\n EXECUTING #{sid} from {user}: {code}")
-                ok = execute_snippet(code, timeout_s=5.0)
+                ok = execute_snippet(code, sid)
                 if ok:
-                    print(f"Finished #{sid}")
+                    print(f"✅ FINISHED #{sid}")
+                    agent.broadcast(BACKEND, "finished", sid)
                 else:
-                    print(f"Failed #{sid}")
+                    print(f"❌ FAILED #{sid}")
             time.sleep(0.5)
         except Exception as e:
             print("Runner error:", repr(e))
