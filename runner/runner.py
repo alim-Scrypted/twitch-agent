@@ -18,14 +18,20 @@ class Agent:
         pag.hotkey(*[str(k) for k in keys])
     def wait(self, seconds:float=0.5):
         time.sleep(min(max(0.0, float(seconds)), 2.0))
-    def open_app(self, name:str):
-        name = str(name).lower().strip()
-        allow = {"notepad": "notepad", "calc": "calc"}
-        if name not in allow:
-            raise ValueError("App not allowed")
-        pag.hotkey("win", "r"); time.sleep(0.2)
-        pag.typewrite(allow[name], interval=0.03)
-        pag.hotkey("enter")
+    # Safe primitives (no GUI launching)
+    def log(self, text:str):
+        print(str(text))
+    def write_output(self, text:str):
+        try:
+            with open("agent_output.txt", "a", encoding="utf-8") as f:
+                f.write(str(text) + "\n")
+        except Exception:
+            pass
+    def broadcast(self, text:str):
+        try:
+            requests.post(f"{BACKEND}/event", json={"type":"runner_msg","id":0,"text":str(text)}, timeout=3)
+        except Exception:
+            pass
 
 agent = Agent()
 
@@ -37,7 +43,8 @@ BANNED_PATTERNS = [
     r'__',                # dunders
     r'\bos\.',            # os.*
     r'\bsys\.',           # sys.*
-    r'\bsubprocess\b'
+    r'\bsubprocess\b',
+    r'\bopen_app\b',      # remove Notepad GUI behavior entirely
 ]
 
 def looks_safe(code: str) -> bool:
@@ -47,7 +54,7 @@ def looks_safe(code: str) -> bool:
 
 def execute_snippet(code: str, timeout_s: float = 5.0) -> bool:
     # Normalize smart quotes from mobile keyboards
-    code = (code or "").replace(""", '"').replace(""", '"').replace("'", "'")
+    code = (code or "").replace("“", '"').replace("”", '"').replace("’", "'")
 
     # Precheck for banned tokens
     if not looks_safe(code):

@@ -10,11 +10,15 @@ class Agent:
     def type(self, text:str, interval:float=0.03): pag.write(str(text), interval=max(0.0, float(interval)))
     def hotkey(self, *keys): pag.hotkey(*[str(k) for k in keys])
     def wait(self, seconds:float=0.5): time.sleep(min(max(0.0, float(seconds)), 2.0))
-    def open_app(self, name:str):
-        name = str(name).lower().strip()
-        allow = {"notepad":"notepad","calc":"calc"}
-        if name not in allow: raise ValueError("App not allowed")
-        pag.hotkey("win","r"); time.sleep(0.2); pag.typewrite(allow[name], interval=0.03); pag.hotkey("enter")
+    # Safe primitives only (no GUI app launching)
+    def log(self, text:str):
+        print(str(text))
+    def write_output(self, text:str):
+        try:
+            with open("agent_output.txt", "a", encoding="utf-8") as f:
+                f.write(str(text)+"\n")
+        except Exception:
+            pass
 
 agent = Agent()
 

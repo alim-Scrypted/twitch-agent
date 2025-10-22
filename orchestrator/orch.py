@@ -4,15 +4,9 @@ BACKEND = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
 
 def synthesize_actions(prompt: str) -> str:
     p = prompt.lower()
-    # Simple mappings; replace with an LLM later
-    if "notepad" in p or "note" in p:
-        text = prompt.replace('"', "'")[:120]
-        return 'agent.open_app("notepad"); agent.wait(0.5); agent.type("' + text + '")'
-    if "calc" in p or "calculator" in p:
-        return 'agent.open_app("calc"); agent.wait(0.5)'
-    # Default: open Notepad and type the prompt text
-    text = prompt.replace('"', "'")[:120]
-    return 'agent.open_app("notepad"); agent.wait(0.4); agent.type("' + text + '")'
+    # Safe default: just log and write output; no GUI app launching
+    text = prompt.replace('"', "'")[:200]
+    return 'agent.log("Prompt received"); agent.write_output("' + text + '")'
 
 def call_ai_for_actions(prompt: str) -> str:
     url = os.getenv("AI_API_URL")
@@ -47,6 +41,10 @@ def main():
                 pid, text, user = latest["id"], latest["text"], latest.get("user")
                 print(f"\n🪄 Generating actions for prompt #{pid} from {user}: {text}")
                 actions = call_ai_for_actions(text)
+                # Ensure actions do not reference GUI apps; prefer safe primitives
+                # If upstream returns unsafe verbs, fall back to synthesize_actions
+                if any(x in (actions or "").lower() for x in ["open_app", "notepad", "calc", "subprocess", "import", "exec(", "eval("]):
+                    actions = synthesize_actions(text)
                 r = requests.post(
                     f"{BACKEND}/submit",
                     json={"user": "orchestrator", "type": "actions", "code": actions},
@@ -54,7 +52,7 @@ def main():
                 )
                 if r.ok:
                     aid = r.json().get("id")
-                    print(f"➡️  Submitted actions as item #{aid}. Approve to execute.")
+                    print(f"➡️  Submitted actions as item #{aid}. Auto-approved if safe.")
                 else:
                     print("❌ Failed to submit actions:", r.text)
             time.sleep(0.5)
