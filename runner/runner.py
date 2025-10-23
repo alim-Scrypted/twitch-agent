@@ -1,8 +1,10 @@
 import os, time, json, traceback, re, sys
 from pathlib import Path
 import requests
+from dotenv import load_dotenv
 from ast_allowlist import validate_snippet
 
+load_dotenv()
 BACKEND = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
 
 OUT_DIR = Path(__file__).resolve().parent / "output"
@@ -68,9 +70,42 @@ def execute_snippet_subproc(code: str, timeout_s: float = 6.0) -> bool:
     except ValueError as e:
         print(f"🚫 Validation failed: {e}")
         return False
-    # spawn worker_subproc.py and feed code via stdin; kill on timeout
-    # (use the snippet I gave you earlier)
-    return True  # Placeholder - implement subprocess execution
+
+    import subprocess
+    process = None
+    try:
+        # Spawn worker_subproc.py and feed code via stdin
+        process = subprocess.Popen(
+            [sys.executable, "worker_subproc.py"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=Path(__file__).resolve().parent
+        )
+
+        # Send code to subprocess via stdin and close it
+        stdout, stderr = process.communicate(code, timeout=timeout_s)
+
+        if process.returncode == 0:
+            print(f"✅ Subprocess execution successful")
+            if stdout:
+                print(f"Output: {stdout}")
+            return True
+        else:
+            print(f"❌ Subprocess execution failed (exit code {process.returncode})")
+            if stderr:
+                print(f"Error: {stderr}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        print(f"⏱️ Subprocess timed out after {timeout_s}s")
+        if process:
+            process.kill()
+        return False
+    except Exception as e:
+        print(f"❌ Subprocess execution error: {e}")
+        return False
 
 def poll_loop():
     print(f" Runner polling {BACKEND}/approved/next")
@@ -80,7 +115,7 @@ def poll_loop():
             if sub and sub.get("code"):
                 sid, code, user = sub["id"], sub["code"], sub.get("user")
                 print(f"\n EXECUTING #{sid} from {user}: {code}")
-                ok = execute_snippet(code, sid)
+                ok = execute_snippet_subproc(code, 6.0)
                 if ok:
                     print(f"✅ FINISHED #{sid}")
                     agent.broadcast(BACKEND, "finished", sid)

@@ -1,5 +1,6 @@
 import os, asyncio, random, time, websockets, json
 from twitchio.ext import commands
+from twitchio.ext.commands import Command
 from dotenv import load_dotenv
 import requests
 
@@ -15,6 +16,8 @@ async def post_async(*args, **kwargs):
 
 class Bot(commands.Bot):
 	def __init__(self):
+		if not OAUTH or not BOT_NICK or not CHANNEL:
+			raise ValueError("Missing required environment variables: TWITCH_OAUTH_TOKEN, TWITCH_BOT_USERNAME, or TWITCH_CHANNEL")
 		super().__init__(token=OAUTH, prefix="!", nick=BOT_NICK, initial_channels=[CHANNEL])
 		self.current_poll = None
 		self.poll_timer = None
@@ -52,6 +55,9 @@ class Bot(commands.Bot):
 				continue
 			for attempt in range(3):
 				try:
+					if not CHANNEL:
+						print(f"❌ No channel configured (kept message): {msg[:60]}...")
+						break
 					channel = self.get_channel(CHANNEL)
 					if channel:
 						await channel.send(msg)
@@ -106,6 +112,11 @@ class Bot(commands.Bot):
 			self.scoreboard_task.cancel()
 			self.scoreboard_task = None
 
+		if not CHANNEL:
+			print(f"❌ No channel configured")
+			self.is_processing = False
+			self.accepting_votes = False
+			return
 		channel = self.get_channel(CHANNEL)
 		if not channel:
 			print(f"❌ No channel {CHANNEL}")
@@ -115,8 +126,11 @@ class Bot(commands.Bot):
 
 		# Queue poll header and options for reliable, rate-limited delivery
 		await self.queue_chat("🎯 NEW POLL! Vote with !1, !2, !3, !4, or !5:")
-		for i, prompt in enumerate(prompt_list):
-			await self.queue_chat(f"{i+1}. {prompt['user']}: {prompt['text']}")
+
+		# Combine all prompts with numbers and separators
+		prompts_text = " | ".join(f"{i+1}) {prompt['user']}: {prompt['text']}" for i, prompt in enumerate(prompt_list))
+		await self.queue_chat(prompts_text)
+
 		await self.queue_chat("⏰ You have 15 seconds to vote!")
 		# Insert flush marker and wait for it so timer starts after messages are sent
 		await self.queue_chat("__FLUSH__")
@@ -131,59 +145,73 @@ class Bot(commands.Bot):
 		"""15-second poll timer"""
 		print("⏰ Timer started")
 		await asyncio.sleep(15)
-		print("⏰ Timer finished")
+		print("⏰ Timer finished - calling end_poll_session")
 		await self.end_poll_session()
 	
 	async def end_poll_session(self):
 		"""End poll and process the winning prompt"""
 		print("🏁 Ending poll session")
+		print(f"   Current poll: {self.current_poll}")
+		print(f"   Poll votes: {self.poll_votes}")
+		print(f"   Accepting votes: {self.accepting_votes}")
 		if not self.current_poll:
 			print("❌ No current poll to end")
 			self.is_processing = False
 			self.accepting_votes = False
 			return
 		
+		if not CHANNEL:
+			print(f"❌ No channel configured")
+			self.is_processing = False
+			self.accepting_votes = False
+			return
 		channel = self.get_channel(CHANNEL)
-		if channel:
-			# Winner with tiebreakers: votes desc, timestamp asc, then random
-			counts = self.poll_votes
-			if counts:
-				max_votes = max(counts.values())
-				tied = [i for i, c in counts.items() if c == max_votes]
-				if len(tied) > 1:
-					earliest_ts = min(self.current_poll[i].get("timestamp", float("inf")) for i in tied)
-					tied_earliest = [i for i in tied if self.current_poll[i].get("timestamp", float("inf")) == earliest_ts]
-					if len(tied_earliest) > 1:
-						winner_index = random.choice(tied_earliest)
-						await self.queue_chat("⚖️ Tie detected — breaking randomly among earliest submissions.")
-					else:
-						winner_index = tied_earliest[0]
-						await self.queue_chat("⚖️ Tie detected — earliest submission wins.")
+		if not channel:
+			print(f"❌ No channel {CHANNEL}")
+			self.is_processing = False
+			self.accepting_votes = False
+			return
+
+		# Winner with tiebreakers: votes desc, timestamp asc, then random
+		print("🎯 Starting winner selection logic")
+		counts = self.poll_votes
+		if counts:
+			max_votes = max(counts.values())
+			tied = [i for i, c in counts.items() if c == max_votes]
+			if len(tied) > 1:
+				earliest_ts = min(self.current_poll[i].get("timestamp", float("inf")) for i in tied)
+				tied_earliest = [i for i in tied if self.current_poll[i].get("timestamp", float("inf")) == earliest_ts]
+				if len(tied_earliest) > 1:
+					winner_index = random.choice(tied_earliest)
+					await self.queue_chat("⚖️ Tie detected — breaking randomly among earliest submissions.")
 				else:
-					winner_index = tied[0]
+					winner_index = tied_earliest[0]
+					await self.queue_chat("⚖️ Tie detected — earliest submission wins.")
 			else:
-				winner_index = 0
+				winner_index = tied[0]
+		else:
+			winner_index = 0
 
+		winner_prompt = self.current_poll[winner_index]
+		vote_count = self.poll_votes[winner_index]
 
-			winner_prompt = self.current_poll[winner_index]
-			vote_count = self.poll_votes[winner_index]
-			
-			# Announce results
-			await self.queue_chat(f"🏆 WINNER: {winner_prompt['user']} with {vote_count} votes!")
-			await self.queue_chat(f"📝 '{winner_prompt['text']}'")
-			await self.queue_chat("✅ This wish is my command!")
+		# Announce results
+		print(f"📢 Announcing winner: {winner_prompt['user']} with {vote_count} votes")
+		await self.queue_chat(f"🏆 WINNER: {winner_prompt['user']} with {vote_count} votes!")
+		await self.queue_chat(f"📝 '{winner_prompt['text']}'")
+		await self.queue_chat("✅ This wish is my command!")
 
-			# Notify backend: mark winner and enqueue cleaned prompt for AI bridge
-			try:
-				wid = winner_prompt.get("id")
-				if wid:
-					r = await post_async(f"{BACKEND}/prompt/win", json={"id": wid}, timeout=5)
-					if r.ok:
-						print(f"🧠 Winner #{wid} queued for AI bridge")
-					else:
-						print(f"⚠️ Failed to queue winner: {r.text}")
-			except Exception as e:
-				print(f"⚠️ Failed to mark winner: {e}")
+		# Notify backend: mark winner and enqueue cleaned prompt for AI bridge
+		try:
+			wid = winner_prompt.get("id")
+			if wid:
+				r = await post_async(f"{BACKEND}/prompt/win", json={"id": wid}, timeout=5)
+				if r.ok:
+					print(f"🧠 Winner #{wid} queued for AI bridge")
+				else:
+					print(f"⚠️ Failed to queue winner: {r.text}")
+		except Exception as e:
+			print(f"⚠️ Failed to mark winner: {e}")
 
 		# Stop scoreboard if running
 		if self.scoreboard_task and not self.scoreboard_task.done():
@@ -218,9 +246,11 @@ class Bot(commands.Bot):
 		self.accepting_votes = False
 		print("✅ Poll session ended - ready for next poll")
 	
-	@commands.command(name="prompt")
+	@commands.command(name="prompt")  # type: ignore
 	async def submit_prompt(self, ctx: commands.Context):
 		"""Submit a new prompt to the queue"""
+		if not ctx.message.content:
+			return await self.queue_chat("Usage: !prompt <idea>")
 		idea = ctx.message.content.partition(" ")[2].strip()
 		if not idea:
 			return await self.queue_chat("Usage: !prompt <idea>")
@@ -253,23 +283,23 @@ class Bot(commands.Bot):
 		except Exception as e:
 			await self.queue_chat(f"❌ Error: {e.__class__.__name__}")
 	
-	@commands.command(name="1")
+	@commands.command(name="1")  # type: ignore
 	async def vote_1(self, ctx: commands.Context):
 		await self.cast_vote(ctx, 0)
-	
-	@commands.command(name="2")
+
+	@commands.command(name="2")  # type: ignore
 	async def vote_2(self, ctx: commands.Context):
 		await self.cast_vote(ctx, 1)
-	
-	@commands.command(name="3")
+
+	@commands.command(name="3")  # type: ignore
 	async def vote_3(self, ctx: commands.Context):
 		await self.cast_vote(ctx, 2)
-	
-	@commands.command(name="4")
+
+	@commands.command(name="4")  # type: ignore
 	async def vote_4(self, ctx: commands.Context):
 		await self.cast_vote(ctx, 3)
-	
-	@commands.command(name="5")
+
+	@commands.command(name="5")  # type: ignore
 	async def vote_5(self, ctx: commands.Context):
 		await self.cast_vote(ctx, 4)
 	
@@ -298,29 +328,29 @@ class Bot(commands.Bot):
 		except asyncio.CancelledError:
 			pass
 	
-	@commands.command(name="forcepoll")
+	@commands.command(name="forcepoll")  # type: ignore
 	async def force_poll(self, ctx: commands.Context):
 		"""Force start a poll"""
 		if self.is_processing:
 			return await self.queue_chat("⏳ Already processing")
-		
+
 		if len(self.pending_prompts) < 2:
 			return await self.queue_chat(f"📝 Need 2+ prompts, have {len(self.pending_prompts)}")
-		
+
 		num_prompts = min(5, len(self.pending_prompts))
 		selected_prompts = random.sample(self.pending_prompts, num_prompts)
 		await self.start_poll_session(selected_prompts)
 		await self.queue_chat(f"🔄 Force started poll with {len(selected_prompts)} prompts!")
-	
-	@commands.command(name="status")
+
+	@commands.command(name="status")  # type: ignore
 	async def status(self, ctx: commands.Context):
 		"""Show bot status"""
 		status_msg = f"📊 Status: {len(self.pending_prompts)} prompts, processing: {self.is_processing}"
 		if self.current_poll:
 			status_msg += f", active poll: {len(self.current_poll)} options"
 		await self.queue_chat(status_msg)
-	
-	@commands.command(name="queue")
+
+	@commands.command(name="queue")  # type: ignore
 	async def show_queue(self, ctx: commands.Context):
 		"""Show current prompt queue"""
 		if not self.pending_prompts:

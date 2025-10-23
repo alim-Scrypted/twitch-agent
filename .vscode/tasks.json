@@ -5,8 +5,13 @@
         "label": "Backend: Uvicorn",
         "type": "shell",
         "command": "${workspaceFolder}\\.venv-backend\\Scripts\\python.exe",
-        "args": ["-m", "uvicorn", "main:app", "--reload", "--port", "8000"],
-        "options": { "cwd": "${workspaceFolder}\\backend" },
+        "args": ["-m", "uvicorn", "backend.main:app", "--reload", "--port", "8000"],
+        "options": {
+          "cwd": "${workspaceFolder}",
+          "env": {
+            "PYTHONPATH": "${workspaceFolder}/backend"
+          }
+        },
         "presentation": { "reveal": "always", "panel": "dedicated", "group": "stack" },
         "problemMatcher": []
       },

@@ -1,5 +1,7 @@
 import os, time, requests
+from dotenv import load_dotenv
 
+load_dotenv()
 BACKEND = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
 
 def synthesize_actions(prompt: str) -> str:
